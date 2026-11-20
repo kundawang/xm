@@ -21,6 +21,10 @@ type moduleCompiler struct {
 
 	subSamples bool
 	isSynth    bool
+
+	// emptyPat is a fully zeroed 64-row pattern used for pattern
+	// order entries that point past the last pattern.
+	emptyPat *pattern
 }
 
 func newSynthCompiler() *moduleCompiler {
@@ -54,6 +58,7 @@ func (c *moduleCompiler) reset(dst *module) {
 
 	c.effectBuf = c.effectBuf[:0]
 	clear(c.effectSet)
+	c.emptyPat = nil
 }
 
 func (c *moduleCompiler) compile(m *xmfile.Module) error {
@@ -428,8 +433,14 @@ func (c *moduleCompiler) compilePatterns(m *xmfile.Module) error {
 	c.result.patternOrder = make([]*pattern, len(m.PatternOrder))
 
 	// Bind pattern order to the actual patterns.
+	// An order entry that points past the last pattern is bound to a
+	// generated empty pattern instead of indexing out of bounds.
 	for i, patternIndex := range m.PatternOrder {
-		c.result.patternOrder[i] = &c.result.patterns[patternIndex]
+		if int(patternIndex) < len(c.result.patterns) {
+			c.result.patternOrder[i] = &c.result.patterns[patternIndex]
+		} else {
+			c.result.patternOrder[i] = c.emptyPattern(m.NumChannels)
+		}
 	}
 
 	numNotes := 0
@@ -474,6 +485,22 @@ func (c *moduleCompiler) compilePatterns(m *xmfile.Module) error {
 	}
 
 	return nil
+}
+
+// emptyPattern lazily creates a 64-row pattern where every note
+// references the shared empty note (ID 0).
+func (c *moduleCompiler) emptyPattern(numChannels int) *pattern {
+	if c.emptyPat != nil {
+		return c.emptyPat
+	}
+	const numRows = 64
+	p := &pattern{
+		numChannels: numChannels,
+		numRows:     numRows,
+		notes:       make([]uint16, numRows*numChannels),
+	}
+	c.emptyPat = p
+	return p
 }
 
 func (c *moduleCompiler) generateNoteFlags(n *patternNote) patternNoteFlags {

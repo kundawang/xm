@@ -106,6 +106,10 @@ const (
 	// Arg: tick number
 	EffectNoteCut
 
+	// Encoding: effect=0x0E and x=D
+	// Arg: tick number (a zero tick triggers the note immediately)
+	EffectNoteDelay
+
 	// Encoding: effect=0x19
 	// Arg: slide left/right speed
 	EffectPanningSlide
@@ -177,7 +181,8 @@ func ConvertEffect(n xmfile.PatternNote) (Effect, error) {
 		case 0x0C:
 			e.Op = EffectNoteCut
 		case 0x0D:
-			err = fmt.Errorf("unsupported 0x0E note delay: %02x => %02X", n.EffectType, e.Arg)
+			e.Op = EffectNoteDelay
+			e.Arg = e.Arg & 0x0f
 		default:
 			err = fmt.Errorf("unsupported 0x0E effect: %02x => %02X (%02x)", n.EffectType, e.Arg>>4, e.Arg)
 		}

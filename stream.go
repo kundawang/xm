@@ -42,12 +42,19 @@ type Stream struct {
 
 	channels       []streamChannel
 	activeChannels []*streamChannel
+
+	// loopCount counts the number of SetLooping-driven restarts.
+	loopCount int
 }
 
 type streamSettings struct {
 	volumeScaling float64
 	loop          bool
 	eventHandler  func(e StreamEvent)
+
+	// loopLimit bounds the number of SetLooping-driven restarts.
+	// A zero value means an unlimited number of restarts.
+	loopLimit int
 }
 
 type jumpKind uint8
@@ -166,6 +173,17 @@ func (s *Stream) SetLooping(loop bool) {
 	s.settings.loop = loop
 }
 
+// SetLoopLimit bounds how many times a looping stream may restart
+// from the beginning. After the limit is reached, Read returns
+// io.EOF just like it does for a non-looping stream.
+//
+// A limit of 0 (the default) allows an unlimited number of restarts.
+// The limit only has an effect when looping is enabled via SetLooping.
+// The counter is reset by Rewind and by a Seek to the start.
+func (s *Stream) SetLoopLimit(limit int) {
+	s.settings.loopLimit = limit
+}
+
 func (s *Stream) assignCompiledModule(m module) {
 	s.module = m
 
@@ -282,7 +300,11 @@ func (s *Stream) Read(b []byte) (int, error) {
 
 	if eof {
 		if s.settings.loop {
-			s.Rewind()
+			if s.settings.loopLimit != 0 && s.loopCount >= s.settings.loopLimit {
+				return written, io.EOF
+			}
+			s.loopCount++
+			s.rewindLoop()
 			return written, nil
 		}
 		return written, io.EOF
@@ -301,6 +323,15 @@ func (s *Stream) Rewind() {
 		})
 	}
 	s.rewind()
+	s.loopCount = 0
+}
+
+// rewindLoop rewinds the stream without emitting the sync event and
+// without resetting the loop restart counter.
+func (s *Stream) rewindLoop() {
+	loopCount := s.loopCount
+	s.rewind()
+	s.loopCount = loopCount
 }
 
 func (s *Stream) rewind() {
@@ -363,6 +394,15 @@ func (s *Stream) nextTick() bool {
 	s.rowTicksRemain--
 	s.tickIndex++
 
+	// An EDx note delay becomes due on this tick (a zero delay
+	// triggers on tick 0, before any other tick processing).
+	for j := range s.channels {
+		ch := &s.channels[j]
+		if ch.noteDelayArmed && int(ch.noteDelayTick) == s.tickIndex {
+			s.triggerDelayedNote(ch)
+		}
+	}
+
 	s.activeChannels = s.activeChannels[:0]
 	baseVolume := s.settings.volumeScaling * s.globalVolume
 	for j := range s.channels {
@@ -404,7 +444,86 @@ func (s *Stream) nextTick() bool {
 		}
 	}
 
+	s.emitChannelStates()
+
 	return true
+}
+
+// tickTime returns the playback time at the beginning of the
+// current tick. Rows advance s.t by secondsPerRow, so tick 0 of
+// a row starts at s.t-secondsPerRow.
+func (s *Stream) tickTime() float64 {
+	tickDur := s.secondsPerRow / float64(s.ticksPerRow)
+	return s.t - s.secondsPerRow + float64(s.tickIndex)*tickDur
+}
+
+// emitChannelStates produces the per-tick channel state timeline
+// event. It is a pure observation path and never mutates the
+// playback state or the rendered PCM bytes.
+func (s *Stream) emitChannelStates() {
+	handler := s.settings.eventHandler
+	if handler == nil {
+		return
+	}
+
+	ev := ChannelTickEvent{
+		Pattern:  s.patternIndex,
+		Row:      s.patternRowIndex,
+		Tick:     s.tickIndex,
+		Time:     s.tickTime(),
+		Channels: make([]ChannelState, len(s.channels)),
+	}
+
+	for i := range s.channels {
+		ch := &s.channels[i]
+
+		instID := -1
+		samplePos := -1
+		if ch.inst != nil && ch.inst.id >= 0 {
+			// Report the 1-based instrument number used by the XM.
+			// Instruments without samples keep id=-1 and are reported
+			// as absent, exactly like a nil instrument.
+			instID = ch.inst.id + 1
+			samplePos = int(ch.sampleOffset)
+		}
+
+		noteNumber := 0
+		if ch.note != nil {
+			noteNumber = int(ch.note.raw)
+		}
+
+		effects := []xmdb.EffectOp(nil)
+		if !ch.effect.IsEmpty() {
+			numEffects := ch.effect.Len()
+			offset := ch.effect.Index()
+			effects = make([]xmdb.EffectOp, 0, numEffects)
+			for _, e := range s.module.effectTab[offset : offset+numEffects] {
+				effects = append(effects, e.op)
+			}
+		}
+
+		ev.Channels[i] = ChannelState{
+			Channel:        ch.id,
+			Pattern:        ev.Pattern,
+			Row:            ev.Row,
+			Tick:           ev.Tick,
+			Time:           ev.Time,
+			Note:           noteNumber,
+			Instrument:     instID,
+			Volume:         ch.volume,
+			Panning:        ch.panning,
+			Active:         ch.IsActive(),
+			KeyOn:          ch.keyOn,
+			SamplePosition: samplePos,
+			Effects:        effects,
+		}
+	}
+
+	handler(StreamEvent{
+		Kind:         EventChannelState,
+		Time:         ev.Time,
+		channelEvent: ev,
+	})
 }
 
 func (s *Stream) tickEnvelopes(ch *streamChannel) {
@@ -463,7 +582,16 @@ func (s *Stream) nextRow() bool {
 	} else {
 		// Execute a pattern jump.
 		s.jumpKind = jumpNone
+		if s.jumpPattern >= len(s.module.patternOrder) {
+			// The jump leaves the song. FT2 stops in this case.
+			return false
+		}
 		s.selectPattern(s.jumpPattern)
+		if s.jumpRow >= s.pattern.numRows {
+			// An overflowing target row is clamped to the last row
+			// instead of indexing past the pattern notes.
+			s.jumpRow = s.pattern.numRows - 1
+		}
 		s.patternRowIndex = s.jumpRow
 		s.patternRowsRemain = s.pattern.numRows - s.patternRowIndex - 1
 	}
@@ -483,6 +611,33 @@ func (s *Stream) nextRow() bool {
 }
 
 func (s *Stream) advanceChannelRow(ch *streamChannel, n *patternNote) {
+	// A previously armed note delay that never became due (the row
+	// ended early due to a jump, or its tick was past the tempo) is
+	// discarded together with its note.
+	ch.noteDelayArmed = false
+	ch.pendingNote = nil
+
+	delayTick, hasDelay := s.noteDelayOf(n)
+	if hasDelay && n.raw != 0 {
+		// EDx note delay: keep playing the old note until the
+		// scheduled tick, then trigger this row's note.
+		ch.pendingNote = n
+		ch.noteDelayTick = delayTick
+		ch.noteDelayArmed = true
+		if int(delayTick) >= s.ticksPerRow {
+			// The trigger would happen outside the row, so the note
+			// is effectively never played.
+			ch.noteDelayArmed = false
+		}
+		return
+	}
+
+	s.assignChannelRow(ch, n)
+}
+
+// assignChannelRow applies a row note and its row effects to the channel.
+// It is used both for normal rows and for due EDx delayed notes.
+func (s *Stream) assignChannelRow(ch *streamChannel, n *patternNote) {
 	ch.assignNote(n)
 
 	if !ch.effect.IsEmpty() {
@@ -491,8 +646,8 @@ func (s *Stream) advanceChannelRow(ch *streamChannel, n *patternNote) {
 
 	if s.settings.eventHandler != nil && n.raw != 0 {
 		instID := 255 // It's a sentinel value that fits 8 bits
-		if ch.inst != nil {
-			instID = ch.inst.id
+		if ch.inst != nil && ch.inst.id >= 0 {
+			instID = ch.inst.id + 1
 		}
 		value := uint64(n.raw) | uint64(instID<<8) | (uint64(math.Float32bits(float32(ch.volume))) << 16)
 		s.settings.eventHandler(StreamEvent{
@@ -502,6 +657,36 @@ func (s *Stream) advanceChannelRow(ch *streamChannel, n *patternNote) {
 			value:   value,
 		})
 	}
+}
+
+// triggerDelayedNote applies a due EDx delayed note.
+//
+// The note is played as if its row started on this tick: assignChannelRow
+// loads the row-effect state, while the per-tick effects are applied
+// exactly once afterwards by the regular nextTick loop. Applying them
+// here as well would double-execute slides on the trigger tick.
+func (s *Stream) triggerDelayedNote(ch *streamChannel) {
+	n := ch.pendingNote
+	ch.noteDelayArmed = false
+	ch.pendingNote = nil
+	ch.noteDelayTick = 0
+
+	s.assignChannelRow(ch, n)
+}
+
+// noteDelayOf reports the EDx note delay tick, if the note carries one.
+func (s *Stream) noteDelayOf(n *patternNote) (uint8, bool) {
+	if n.effect.IsEmpty() {
+		return 0, false
+	}
+	numEffects := n.effect.Len()
+	offset := n.effect.Index()
+	for _, e := range s.module.effectTab[offset : offset+numEffects] {
+		if e.op == xmdb.EffectNoteDelay {
+			return e.rawValue, true
+		}
+	}
+	return 0, false
 }
 
 func (s *Stream) applyRowEffect(ch *streamChannel, n *patternNote) {
@@ -572,6 +757,9 @@ func (s *Stream) applyRowEffect(ch *streamChannel, n *patternNote) {
 			s.jumpKind = jumpPatternBreak
 			s.jumpPattern = s.patternIndex + 1
 			s.jumpRow = int(e.arp[0])
+
+		case xmdb.EffectNoteDelay:
+			// Scheduling is handled in advanceChannelRow; nothing to do here.
 
 		case xmdb.EffectSetBPM:
 			s.setBPM(e.floatValue)

@@ -55,6 +55,12 @@ type streamChannel struct {
 	// Ping-pong loop state.
 	reverse bool
 
+	// EDx note delay state. When noteDelayArmed is true, pendingNote is
+	// not played until the row tick reaches noteDelayTick.
+	noteDelayArmed bool
+	noteDelayTick  uint8
+	pendingNote    *patternNote
+
 	volumeEnvelope  envelopeRunner
 	panningEnvelope envelopeRunner
 

@@ -10,8 +10,8 @@ Bugs:
 - hardcore.xm results in an error (unknown sample encoding scheme)
 
 Corner-cases:
-- play an empty pattern if pattern order entry index is invalid
-- jump to an overflowing pattern
+- [x] play an empty pattern if pattern order entry index is invalid
+- [x] jump to an overflowing pattern
 
 Correctness:
 - tests (check the generated PCM bytes)

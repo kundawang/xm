@@ -36,6 +36,16 @@ const (
 	//
 	// Experimental: the events handling API may change significantly in the future.
 	EventSync
+
+	// EventChannelState is emitted once per rendered tick.
+	// It carries a per-channel state snapshot (see ChannelTickEvent)
+	// that can be used to visualize which channels are sounding.
+	//
+	// This event is only produced when a ChannelTimeline handler is
+	// installed. It never affects the rendered PCM bytes.
+	//
+	// Experimental: the events handling API may change significantly in the future.
+	EventChannelState
 )
 
 // StreamEvent holds a single Stream event data.
@@ -65,6 +75,9 @@ type StreamEvent struct {
 	Time float64
 
 	value uint64
+
+	// channelEvent is populated only for Kind=EventChannelState.
+	channelEvent ChannelTickEvent
 }
 
 // NoteEventData returns the event data if e.Kind=EventSync.
